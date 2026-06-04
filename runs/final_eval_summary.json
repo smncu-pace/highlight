@@ -1,0 +1,64 @@
+{
+  "num_val": 5000,
+  "best_single_cached": [
+    0.9441999793052673,
+    "runs/tta_logits/runs__dense_pretrained_mix_cutmix_10epoch__best__resize248__ten.pt"
+  ],
+  "best_equal": [
+    0.9488000273704529,
+    "prob",
+    [
+      "runs/tta_logits2/ema__ten__resize291__crop240.pt",
+      "runs/tta_logits2/sgd__ten__resize253__crop208.pt",
+      "runs/tta_logits2/ema__center__resize240__crop240.pt",
+      "runs/tta_logits/runs__dense_resume_lightaug_ema_5epoch__best__resize256__center.pt",
+      "runs/tta_logits/runs__dense_pretrained_mix_cutmix_10epoch__best__resize224__ten.pt",
+      "runs/tta_logits/runs__dense_resume_sgd_cosine_8epoch__best__resize256__center.pt"
+    ]
+  ],
+  "best_greedy_prob": [
+    0.949400007724762,
+    [
+      {
+        "acc": 0.9441999793052673,
+        "alpha": 1.0,
+        "name": "runs/tta_logits/runs__dense_pretrained_mix_cutmix_10epoch__best__resize248__ten.pt"
+      },
+      {
+        "acc": 0.9480000138282776,
+        "alpha": 0.66,
+        "name": "runs/tta_logits2/sgd__center__resize274__crop240.pt"
+      },
+      {
+        "acc": 0.9488000273704529,
+        "alpha": 0.39,
+        "name": "runs/tta_logits/runs__dense_resume_sgd_cosine_8epoch__best__resize256__center.pt"
+      },
+      {
+        "acc": 0.949400007724762,
+        "alpha": 0.02,
+        "name": "runs/tta_logits/runs__dense_resume_lightaug_ema_5epoch__best__resize240__ten.pt"
+      },
+      {
+        "acc": 0.949400007724762,
+        "alpha": 0.01,
+        "name": "runs/tta_logits/runs__dense_pretrained_mix_cutmix_10epoch__best__resize224__ten.pt"
+      },
+      {
+        "acc": 0.949400007724762,
+        "alpha": 0.01,
+        "name": "runs/tta_logits2/sgd__ten__resize253__crop208.pt"
+      },
+      {
+        "acc": 0.949400007724762,
+        "alpha": 0.01,
+        "name": "runs/tta_logits/runs__dense_resume_lightaug_ema_5epoch__best__resize256__ten.pt"
+      },
+      {
+        "acc": 0.949400007724762,
+        "alpha": 0.03,
+        "name": "runs/tta_logits/runs__dense_resume_sgd_lowlr_noaug_8epoch__best__resize224__ten.pt"
+      }
+    ]
+  ]
+}

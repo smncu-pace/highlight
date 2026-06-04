@@ -1,0 +1,25 @@
+[project]
+name = "springdance1"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.8.5",
+    "numpy>=2.4.6",
+    "pillow>=12.2.0",
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
+    "tqdm>=4.67.3",
+]
+
+[project.scripts]
+springdance1 = "springdance1:main"
+
+[build-system]
+requires = ["uv_build>=0.11.18,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
