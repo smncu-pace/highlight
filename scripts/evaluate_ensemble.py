@@ -13,9 +13,9 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from springdance1.hss_convert import freeze_all_hss_masks
-from springdance1.hss_mask import summarize_hss_masks
-from springdance1.hss_training import maybe_convert_model_to_hss
+from springdance1.hss.convert import freeze_all_hss_masks
+from springdance1.hss.metrics import summarize_hss_masks
+from springdance1.hss.training import add_hss_args, maybe_convert_model_to_hss
 from springdance1.models import resnet50
 from train import load_checkpoint_if_needed
 from scripts.evaluate import ImageNet100TTADataset, load_val_dataset, make_tta_transform
@@ -46,9 +46,10 @@ def build_models(args: argparse.Namespace) -> list[nn.Module]:
         summary = summarize_hss_masks(models[0])
         print(
             "HSS masks: "
-            f"density={summary[density]:.6f} "
-            f"sparsity={summary[sparsity]:.6f} "
-            f"nonzero={summary[nonzero]} numel={summary[numel]}"
+            f"density={summary['density']:.6f} "
+            f"sparsity={summary['sparsity']:.6f} "
+            f"covered_ratio={summary['covered_ratio']:.6f} "
+            f"nonzero={summary['nonzero']} numel={summary['numel']}"
         )
     return models
 
@@ -91,12 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
-    parser.add_argument("--hss", action="store_true")
-    parser.add_argument("--hss-macro-block-size", type=int, default=16)
-    parser.add_argument("--hss-include-linear", action="store_true")
-    parser.add_argument("--hss-prune-first-conv", action="store_true")
-    parser.add_argument("--hss-fixed-mask", action="store_true")
-    return parser.parse_args()
+    return add_hss_args(parser).parse_args()
 
 
 def main() -> None:

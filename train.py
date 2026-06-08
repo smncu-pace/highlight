@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import copy
 import json
 import random
@@ -16,11 +17,13 @@ from torchvision import transforms
 from torchvision.models import ResNet50_Weights
 from tqdm import tqdm
 
-from springdance1.hss_convert import freeze_all_hss_masks
-from springdance1.hss_mask import summarize_hss_masks
-from springdance1.hss_regularization import hss_regularization
-from springdance1.hss_training import (
+from springdance1.hss.convert import freeze_all_hss_masks
+from springdance1.hss.metrics import summarize_hss_masks
+from springdance1.hss.regularization import hss_regularization
+from springdance1.hss.training import (
     add_hss_args,
+    enforce_hss_masks_after_step,
+    hss_pattern_from_args,
     initialize_hss_masks,
     maybe_convert_model_to_hss,
     maybe_update_hss_masks_for_epoch,
@@ -89,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr", type=float, default=0.0)
     parser.add_argument("--resume", default="")
     parser.add_argument("--resume-after-hss", action="store_true", help="Load an HSS checkpoint after layer conversion.")
+    parser.add_argument("--eval", action="store_true", help="Only evaluate the requested checkpoint and exit.")
     parser.add_argument("--teacher-checkpoint", default="", help="Dense teacher checkpoint for knowledge distillation.")
     parser.add_argument("--distill-alpha", type=float, default=0.0, help="Weight for teacher KL loss; 0 disables distillation.")
     parser.add_argument("--distill-temperature", type=float, default=2.0)
@@ -155,6 +159,7 @@ def load_checkpoint_if_needed(model: nn.Module, path: str) -> None:
         state_dict = checkpoint.get("state_dict") or checkpoint.get("model") or checkpoint
     else:
         state_dict = checkpoint
+    state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"Loaded checkpoint: {path}")
     print(f"missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
@@ -250,7 +255,9 @@ class ModelEma:
         ema_state = self.module.state_dict()
         for key, ema_value in ema_state.items():
             model_value = model_state[key].detach()
-            if torch.is_floating_point(ema_value):
+            if key.endswith("hss_mask"):
+                ema_value.copy_(model_value)
+            elif torch.is_floating_point(ema_value):
                 ema_value.mul_(self.decay).add_(model_value, alpha=1.0 - self.decay)
             else:
                 ema_value.copy_(model_value)
@@ -276,6 +283,17 @@ def make_scheduler(
     return None
 
 
+def apply_hss_cli_overrides(args: argparse.Namespace) -> None:
+    if not args.hss:
+        return
+    if args.hss_epochs > 0:
+        args.epochs = args.hss_epochs
+    if args.hss_lr > 0:
+        args.lr = args.hss_lr
+    if args.hss_output_dir:
+        args.output_dir = args.hss_output_dir
+
+
 def print_hss_summary(model: nn.Module) -> None:
     summary = summarize_hss_masks(model)
     print(
@@ -284,8 +302,106 @@ def print_hss_summary(model: nn.Module) -> None:
         f"nonzero={summary['nonzero']} "
         f"zero={summary['zero']} "
         f"density={summary['density']:.6f} "
-        f"sparsity={summary['sparsity']:.6f}"
+        f"sparsity={summary['sparsity']:.6f} "
+        f"covered_ratio={summary.get('covered_ratio', 0.0):.6f} "
+        f"estimated_weight_compute_speedup={summary.get('estimated_weight_compute_speedup', 0.0):.6f}"
     )
+
+
+def save_train_log_row(path: Path, row: dict[str, int | float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def save_checkpoint_aliases(
+    model: nn.Module,
+    args: argparse.Namespace,
+    output_dir: Path,
+    filename: str,
+    epoch: int,
+    val_acc: float,
+) -> None:
+    state = model.state_dict()
+    args_payload = {key: value for key, value in vars(args).items() if not key.startswith("_")}
+    payload = {"model": state, "args": args_payload, "epoch": epoch, "val_acc": val_acc}
+    torch.save(payload, output_dir / filename)
+    if filename == "best_checkpoint.pth":
+        torch.save(payload, output_dir / "best.pth")
+    if filename == "last_checkpoint.pth":
+        torch.save(payload, output_dir / "last.pth")
+
+
+def build_hss_metrics(
+    model: nn.Module,
+    args: argparse.Namespace,
+    dense_top1: float | None,
+    zero_shot_pruned_top1: float | None,
+    best_finetune_top1: float | None,
+) -> dict[str, str | int | float | None]:
+    pattern = hss_pattern_from_args(args)
+    summary = summarize_hss_masks(model)
+    best_top1 = best_finetune_top1 if best_finetune_top1 is not None else zero_shot_pruned_top1
+    accuracy_drop = None
+    if dense_top1 is not None and best_top1 is not None:
+        accuracy_drop = dense_top1 - best_top1
+    return {
+        "pattern": pattern.name(),
+        "rank0": pattern.rank0_label(),
+        "rank1": pattern.rank1_label(),
+        "theoretical_density": pattern.density(),
+        "theoretical_sparsity": pattern.sparsity(),
+        "actual_density": summary["density"],
+        "actual_sparsity": summary["sparsity"],
+        "covered_ratio": summary["covered_ratio"],
+        "dense_top1": dense_top1,
+        "zero_shot_pruned_top1": zero_shot_pruned_top1,
+        "best_finetune_top1": best_top1,
+        "accuracy_drop": accuracy_drop,
+        "estimated_weight_compute_speedup": summary["estimated_weight_compute_speedup"],
+        "num_hss_params": summary["numel"],
+        "num_hss_nonzero": summary["nonzero"],
+        "num_hss_zero": summary["zero"],
+    }
+
+
+def write_hss_metrics(
+    model: nn.Module,
+    args: argparse.Namespace,
+    output_dir: Path,
+    dense_top1: float | None,
+    zero_shot_pruned_top1: float | None,
+    best_finetune_top1: float | None,
+) -> dict[str, str | int | float | None]:
+    metrics = build_hss_metrics(model, args, dense_top1, zero_shot_pruned_top1, best_finetune_top1)
+    metrics_path = output_dir / "metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
+    print(f"saved_metrics={metrics_path}", flush=True)
+    return metrics
+
+
+def write_dense_metrics(output_dir: Path, dense_top1: float | None) -> dict[str, str | int | float | None]:
+    metrics: dict[str, str | int | float | None] = {
+        "pattern": "dense",
+        "rank0": "disabled",
+        "rank1": "disabled",
+        "actual_density": 1.0,
+        "actual_sparsity": 0.0,
+        "estimated_weight_compute_speedup": 1.0,
+        "dense_top1": dense_top1,
+        "zero_shot_pruned_top1": dense_top1,
+        "best_finetune_top1": dense_top1,
+        "accuracy_drop": 0.0 if dense_top1 is not None else None,
+        "covered_ratio": 0.0,
+    }
+    metrics_path = output_dir / "metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
+    print(f"saved_metrics={metrics_path}", flush=True)
+    return metrics
 
 
 def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
@@ -364,6 +480,8 @@ def train_one_epoch(
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+        if args.hss:
+            enforce_hss_masks_after_step(model, optimizer)
         if ema is not None:
             ema.update(model)
 
@@ -400,40 +518,87 @@ def validate(model: nn.Module, loader: DataLoader, criterion: nn.Module, args: a
 
 def main() -> None:
     args = parse_args()
+    apply_hss_cli_overrides(args)
     torch.backends.cudnn.benchmark = args.device.startswith("cuda")
 
     train_loader, val_loader = make_loaders(args)
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     model = resnet50(num_classes=100)
     load_pretrained_if_needed(model, args.pretrained)
     if not args.resume_after_hss:
         load_checkpoint_if_needed(model, args.resume)
+
+    dense_top1: float | None = None
+    if args.eval or (args.hss and not args.resume_after_hss):
+        model.to(args.device)
+        dense_loss, dense_top1 = validate(model, val_loader, criterion, args)
+        print(f"dense_val_loss={dense_loss:.4f} dense_top1={dense_top1:.4f}", flush=True)
+        if args.eval and not args.hss:
+            save_checkpoint_aliases(model, args, output_dir, "best_checkpoint.pth", epoch=-1, val_acc=dense_top1)
+            save_train_log_row(
+                output_dir / "train_log.csv",
+                {
+                    "epoch": -1,
+                    "train_loss": 0.0,
+                    "train_acc": 0.0,
+                    "val_loss": dense_loss,
+                    "val_acc": dense_top1,
+                    "lr": args.lr,
+                },
+            )
+            write_dense_metrics(output_dir, dense_top1)
+            return
+
     model = maybe_convert_model_to_hss(model, args)
     if args.resume_after_hss:
         load_checkpoint_if_needed(model, args.resume)
     model.to(args.device)
+
+    zero_shot_pruned_top1: float | None = None
     if args.resume_after_hss and args.hss:
         if args.hss_fixed_mask:
             freeze_all_hss_masks(model)
         print_hss_summary(model)
     else:
         initialize_hss_masks(model, args)
+
+    if args.hss:
+        zero_loss, zero_shot_pruned_top1 = validate(model, val_loader, criterion, args)
+        print(f"zero_shot_pruned_val_loss={zero_loss:.4f} zero_shot_pruned_top1={zero_shot_pruned_top1:.4f}", flush=True)
+        save_checkpoint_aliases(model, args, output_dir, "best_checkpoint.pth", epoch=-1, val_acc=zero_shot_pruned_top1)
+        save_train_log_row(
+            output_dir / "train_log.csv",
+            {
+                "epoch": -1,
+                "train_loss": 0.0,
+                "train_acc": 0.0,
+                "val_loss": zero_loss,
+                "val_acc": zero_shot_pruned_top1,
+                "lr": args.lr,
+            },
+        )
+        if args.eval:
+            write_hss_metrics(model, args, output_dir, dense_top1, zero_shot_pruned_top1, zero_shot_pruned_top1)
+            return
+
     teacher = make_teacher_if_needed(args)
     ema = ModelEma(model, args.model_ema_decay) if args.model_ema else None
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = make_optimizer(model, args)
     scheduler = make_scheduler(optimizer, args)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     start = time.time()
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and args.device.startswith("cuda"))
-    best_acc = 0.0
+    best_acc = zero_shot_pruned_top1 if zero_shot_pruned_top1 is not None else 0.0
+    train_log_path = output_dir / "train_log.csv"
 
     for epoch in range(args.epochs):
         maybe_update_hss_masks_for_epoch(model, args, epoch)
+        if args.hss:
+            enforce_hss_masks_after_step(model, optimizer)
         train_loss, train_acc = train_one_epoch(model, teacher, ema, train_loader, criterion, optimizer, scaler, args, epoch)
         val_model = ema.module if ema is not None else model
         val_loss, val_acc = validate(val_model, val_loader, criterion, args)
@@ -446,16 +611,29 @@ def main() -> None:
             f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} lr={lr:.6g}",
             flush=True,
         )
+        save_train_log_row(
+            train_log_path,
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "lr": lr,
+            },
+        )
         if val_acc > best_acc:
             best_acc = val_acc
-            best_path = output_dir / "best.pth"
-            best_state = ema.module.state_dict() if ema is not None else model.state_dict()
-            torch.save({"model": best_state, "args": vars(args), "epoch": epoch, "val_acc": val_acc}, best_path)
+            best_path = output_dir / ("best_checkpoint.pth" if args.hss else "best.pth")
+            best_model = ema.module if ema is not None else model
+            save_checkpoint_aliases(best_model, args, output_dir, best_path.name, epoch, val_acc)
             print(f"saved_best={best_path} val_acc={val_acc:.4f}", flush=True)
 
-    checkpoint_path = output_dir / "last.pth"
-    final_state = ema.module.state_dict() if ema is not None else model.state_dict()
-    torch.save({"model": final_state, "args": vars(args), "val_acc": best_acc}, checkpoint_path)
+    checkpoint_path = output_dir / ("last_checkpoint.pth" if args.hss else "last.pth")
+    final_model = ema.module if ema is not None else model
+    save_checkpoint_aliases(final_model, args, output_dir, checkpoint_path.name, args.epochs - 1, best_acc)
+    if args.hss:
+        write_hss_metrics(model, args, output_dir, dense_top1, zero_shot_pruned_top1, best_acc)
     print(f"saved={checkpoint_path}", flush=True)
     print(f"elapsed_sec={time.time() - start:.1f}", flush=True)
 

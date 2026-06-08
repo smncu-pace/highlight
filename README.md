@@ -1,150 +1,172 @@
 # springdance1
 
-A PyTorch project managed by `uv`, currently containing a ResNet-50 image classification model and an HSS 3:4 x 2:4 mask system for Conv2d/Linear sparse training experiments.
+PyTorch ResNet-50 ImageNet-100 experiments with a Level 1 software reproduction path for HighLight-style hierarchical structured sparsity (HSS).
+
+This repository does not implement a hardware accelerator or CUDA sparse kernels. HSS is applied by masked PyTorch layers that run dense operators with `weight * hss_mask`.
 
 ## Environment
 
 - Python 3.12
-- PyTorch managed by `uv`
-- CUDA support follows the installed PyTorch wheel
+- PyTorch / torchvision managed by `uv`
+- Dataset default: `clane9/imagenet-100` or local parquet snapshot under `data/imagenet-100-hf`
 
-## Smoke test
-
-```bash
-uv run springdance1
-```
-
-This constructs ResNet-50, converts eligible layers to HSS layers, updates masks, and runs one fake ImageNet-shaped forward pass.
-
-## Use the dense model
+## Dense Model
 
 ```python
 from springdance1.models import resnet50
 
-model = resnet50(num_classes=1000)
+model = resnet50(num_classes=100)
 ```
 
-## Use HSS conversion
+## HSS Level 1 Implementation
 
-```python
-from springdance1.hss_convert import convert_resnet_to_hss, update_all_hss_masks
-from springdance1.hss_mask import summarize_hss_masks
-from springdance1.models import resnet50
+The configurable two-rank pattern is:
 
-model = resnet50(num_classes=1000)
-model = convert_resnet_to_hss(
-    model,
-    macro_block_size=16,
-    include_linear=True,
-    skip_first_conv=True,
-)
-update_all_hss_masks(model)
-print(summarize_hss_masks(model))
+```text
+C1(G1:H1) -> C0(G0:H0)
 ```
 
-Dense checkpoints can be loaded before conversion, or after conversion with `strict=False` so newly registered `hss_mask` buffers do not break checkpoint loading.
+Default HSS behavior is `C1(3:4) -> C0(2:4)`, giving theoretical density `3/4 * 2/4 = 3/8` and sparsity `62.5%`.
 
-## Training integration
+For Conv2d weights `[M, C, R, S]`, masks are generated independently along the input-channel fiber `W[m, :, r, s]`. For Linear weights `[O, I]`, masks are generated independently along each input row `W[o, :]`.
 
-The current repository does not include a `train.py` yet. When adding HSS to an existing ImageNet-100 training script, import these helpers instead of rewriting the framework:
+The pruning order is lower-to-higher rank:
 
-```python
-from springdance1.hss_regularization import hss_regularization
-from springdance1.hss_training import (
-    add_hss_args,
-    initialize_hss_masks,
-    maybe_convert_model_to_hss,
-    maybe_update_hss_masks_for_epoch,
-)
+1. C0 magnitude pruning keeps the largest `G0` absolute values in each `H0` block.
+2. C1 block pruning scores each C0 block by RMS magnitude after C0 masking, then keeps the largest `G1` C0 blocks in each C1 group.
 
-parser = add_hss_args(parser)
+Tail elements that cannot form complete HSS groups are kept by default for shape safety and to avoid accidental accuracy collapse. Metrics report `covered_ratio` for the fraction of masked-layer parameters covered by complete HSS groups.
 
-model = build_resnet50()
-# Load dense checkpoint here if present.
-model = maybe_convert_model_to_hss(model, args)
-initialize_hss_masks(model, args)
+## CLI Arguments
 
-for epoch in range(start_epoch, args.epochs):
-    maybe_update_hss_masks_for_epoch(model, args, epoch)
-    ce_loss = criterion(output, target)
-    loss = ce_loss
-    if args.hss_reg:
-        loss = loss + hss_regularization(model, args.hss_lambda_value, args.hss_lambda_block)
-```
-
-## Added HSS command-line arguments
+Key HSS arguments:
 
 - `--hss`
-- `--hss-macro-block-size`, default `16`
-- `--hss-include-linear`
+- `--hss-rank0-enable --hss-rank0-g 2 --hss-rank0-h 4`
+- `--hss-rank1-enable --hss-rank1-g 3 --hss-rank1-h 4`
+- `--hss-include-linear` / `--no-hss-include-linear`
 - `--hss-prune-first-conv`
-- `--hss-warmup-epochs`, default `0`
-- `--hss-mask-update-interval`, default `0`
 - `--hss-fixed-mask`
-- `--hss-reg`
-- `--hss-lambda-value`, default `1e-6`
-- `--hss-lambda-block`, default `1e-5`
+- `--hss-mask-update-interval 0`
+- `--hss-warmup-epochs 0`
+- `--hss-output-dir runs/hss_xxx`
+- `--hss-eval-before-finetune`
+- `--hss-epochs 30`
+- `--hss-lr 1e-3`
 
-## Example experiment commands
+By default, the top-level ResNet stem `conv1` is skipped. Linear `fc` is pruned by default unless `--no-hss-include-linear` is passed.
 
-Dense baseline:
+## Commands
 
-```bash
-python train.py --arch resnet50 --dataset imagenet100 ...
-```
-
-HSS fixed-mask fine-tune:
-
-```bash
-python train.py --arch resnet50 --dataset imagenet100 \
-    --resume path/to/dense_checkpoint.pth \
-    --hss \
-    --hss-macro-block-size 16 \
-    --hss-mask-update-interval 0 \
-    --hss-fixed-mask \
-    --epochs 30 \
-    --lr 0.001
-```
-
-HSS periodic-mask training:
+Evaluate a dense checkpoint:
 
 ```bash
-python train.py --arch resnet50 --dataset imagenet100 \
-    --resume path/to/dense_checkpoint.pth \
-    --hss \
-    --hss-macro-block-size 16 \
-    --hss-warmup-epochs 0 \
-    --hss-mask-update-interval 5 \
-    --epochs 60 \
-    --lr 0.001
+python train.py \
+  --arch resnet50 \
+  --dataset imagenet100 \
+  --resume path/to/dense_resnet50.pth \
+  --eval
 ```
 
-HSS periodic-mask training with auxiliary regularization:
+HSS `C1(3:4) -> C0(2:4)` fixed-mask fine-tune:
 
 ```bash
-python train.py --arch resnet50 --dataset imagenet100 \
-    --resume path/to/dense_checkpoint.pth \
-    --hss \
-    --hss-macro-block-size 16 \
-    --hss-mask-update-interval 5 \
-    --hss-reg \
-    --hss-lambda-value 1e-6 \
-    --hss-lambda-block 1e-5 \
-    --epochs 60 \
-    --lr 0.001
+python train.py \
+  --arch resnet50 \
+  --dataset imagenet100 \
+  --resume path/to/dense_resnet50.pth \
+  --hss \
+  --hss-rank0-enable \
+  --hss-rank0-g 2 \
+  --hss-rank0-h 4 \
+  --hss-rank1-enable \
+  --hss-rank1-g 3 \
+  --hss-rank1-h 4 \
+  --hss-fixed-mask \
+  --hss-include-linear \
+  --hss-output-dir runs/hss_c1_3x4_c0_2x4 \
+  --epochs 30 \
+  --lr 1e-3
 ```
 
-## Default pruning coverage
+HSS periodic mask update:
 
-By default, `convert_resnet_to_hss(..., skip_first_conv=True)` leaves the top-level ResNet stem `conv1` dense. Linear layers are included only when `include_linear=True`; in CLI usage that corresponds to passing `--hss-include-linear`.
+```bash
+python train.py \
+  --arch resnet50 \
+  --dataset imagenet100 \
+  --resume path/to/dense_resnet50.pth \
+  --hss \
+  --hss-rank0-enable \
+  --hss-rank0-g 2 \
+  --hss-rank0-h 4 \
+  --hss-rank1-enable \
+  --hss-rank1-g 3 \
+  --hss-rank1-h 4 \
+  --hss-mask-update-interval 5 \
+  --hss-include-linear \
+  --hss-output-dir runs/hss_periodic_c1_3x4_c0_2x4 \
+  --epochs 60 \
+  --lr 1e-3
+```
 
-The first version does not implement CUDA sparse kernels. It applies sparsity by using `weight * hss_mask` in the dense PyTorch forward path.
+Run the sweep:
 
-## Edge cases handled
+```bash
+python scripts/hss_sweep.py \
+  --arch resnet50 \
+  --dataset imagenet100 \
+  --resume path/to/dense_resnet50.pth \
+  --output-dir runs/hss_sweep \
+  --epochs 30 \
+  --lr 1e-3
+```
 
-- `macro_block_size` must be positive and divisible by 4.
-- If fewer than 4 complete macro blocks are available, all weights are kept.
-- If the number of macro blocks is not a multiple of 4, the final incomplete macro-block group is kept.
-- Tail weights that cannot form a complete macro block are kept by default for shape safety.
-- Masks are buffers, not parameters, so optimizers do not update them.
-- Dense checkpoints can be migrated by loading before conversion or by using `strict=False` after conversion.
+Plot Pareto curves:
+
+```bash
+python scripts/plot_hss_pareto.py \
+  --summary runs/hss_sweep/summary.csv \
+  --output-dir runs/hss_sweep
+```
+
+## Outputs
+
+Each HSS run writes:
+
+- `metrics.json`
+- `best_checkpoint.pth`
+- `best.pth` compatibility alias
+- `last_checkpoint.pth`
+- `last.pth` compatibility alias
+- `train_log.csv`
+
+Sweep output:
+
+- `runs/hss_sweep/<pattern_name>/metrics.json`
+- `runs/hss_sweep/<pattern_name>/best_checkpoint.pth`
+- `runs/hss_sweep/<pattern_name>/train_log.csv`
+- `runs/hss_sweep/summary.csv`
+
+Pareto plots:
+
+- `pareto_accuracy_sparsity.png`
+- `pareto_accuracy_speedup.png`
+- `pareto_accuracy_drop_vs_speedup.png`
+
+## Checkpoints
+
+Curated trained checkpoints are kept under `weights/`:
+
+- `dense_adamw_cosine_6epoch_best.pth`
+- `dense_pretrained_mix_cutmix_10epoch_best.pth`
+- `dense_resume_lightaug_ema_5epoch_best.pth`
+- `dense_resume_sgd_cosine_8epoch_best.pth`
+
+Large local datasets and experiment outputs are intentionally excluded from git via `.gitignore`. Recreate or download ImageNet-100 data with the scripts in `scripts/`, then point `--data-dir` at the local snapshot.
+
+## Metrics Note
+
+`estimated_weight_compute_speedup = 1.0 / actual_density`.
+
+This is only a theoretical estimate of weight multiply-count reduction in masked layers. It is not measured latency and does not account for memory movement, dense PyTorch kernels, sparse kernel overhead, accelerator scheduling, or hardware-specific utilization.

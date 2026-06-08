@@ -6,14 +6,15 @@ from typing import Any
 
 from torch import nn
 
-from springdance1.hss_convert import (
+from springdance1.hss.convert import (
     apply_all_weight_masks,
     convert_resnet_to_hss,
     freeze_all_hss_masks,
     mask_optimizer_state,
     update_all_hss_masks,
 )
-from springdance1.hss_mask import HSSPattern, summarize_hss_masks
+from springdance1.hss.metrics import summarize_hss_masks
+from springdance1.hss.pattern import HSSPattern
 
 
 def add_hss_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
